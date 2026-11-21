@@ -1,7 +1,7 @@
 # leaneq
 leaneq is an equalizer program that's lightweight (and lives in your tray)
 
-the program only takes up 3-4 MB of RAM :)
+the program only takes up 2-4 MB of RAM :)
 [check here](https://postimg.cc/v4BJbk2g)
 
 <img src="leaneq.png" alt="leaneq" width="500">
