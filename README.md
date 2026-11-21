@@ -1,6 +1,8 @@
 # leaneq
-![preview and logo](insertlater)
-leaneq is an equalizer program that's lightweight
+leaneq is an equalizer program that's lightweight (and lives in your tray)
+
+<img src="leaneq.png" alt="leaneq" width="500">
+
 
 ## download
 [![Latest Release](https://img.shields.io/github/v/release/hartelex/leaneq?display_name=tag)](https://github.com/hartelex/leaneq/releases)
