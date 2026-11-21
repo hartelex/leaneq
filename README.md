@@ -1,11 +1,15 @@
 # leaneq
-
+![preview and logo](insertlater)
 leaneq is an equalizer program that's lightweight
 
 ## download
 [![Latest Release](https://img.shields.io/github/v/release/hartelex/leaneq?display_name=tag)](https://github.com/hartelex/leaneq/releases)
 
-it's in releases buddy
+1. download it from releases buddy
+2. get a virtual audio device, for example [VB-CABLE](https://vb-audio.com/Cable/index.htm)
+3. select the virtual audio device as input
+
+should work :)
 
 ## audio routing
 
