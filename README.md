@@ -3,7 +3,7 @@
 leaneq is an equalizer program that's lightweight
 
 ## download
-
+[![Latest Release](https://img.shields.io/github/v/release/hartelex/leaneq?display_name=tag)](https://github.com/hartelex/leaneq/releases/latest)
 it's in releases buddy
 
 ## audio routing
