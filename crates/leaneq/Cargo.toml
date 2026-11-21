@@ -1,0 +1,15 @@
+[package]
+name = "leaneq"
+version = "1.0.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+interprocess.workspace = true
+leaneq-engine = { path = "../leaneq-engine" }
+leaneq-ui = { path = "../leaneq-ui" }
+leaneq-tray = { path = "../leaneq-tray" }
+leaneq-proto = { path = "../leaneq-proto" }

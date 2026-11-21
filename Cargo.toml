@@ -1,0 +1,36 @@
+[workspace]
+members = [
+    "crates/leaneq-dsp",
+    "crates/leaneq-proto",
+    "crates/leaneq-engine",
+    "crates/leaneq-ui",
+    "crates/leaneq-tray",
+    "crates/leaneq",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.82"
+
+[workspace.dependencies]
+cpal = "0.16"
+rtrb = "0.3"
+triple_buffer = "6.2"
+interprocess = "2.2"
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+toml = "0.9"
+clap = { version = "4.5", features = ["derive"] }
+libm = "0.2"
+ctrlc = "3.5"
+tray-icon = "0.21"
+muda = "0.17"
+winit = "0.30"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
