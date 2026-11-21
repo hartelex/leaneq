@@ -1,0 +1,72 @@
+preamp_db = -2.0
+bypass = false
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 31.0
+gain_db = 0.0
+q = 1.0
+
+[[bands]]
+enabled = true
+filter_type = "LowShelf"
+freq_hz = 62.0
+gain_db = 2.0
+q = 0.707
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 125.0
+gain_db = 1.5
+q = 1.0
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 250.0
+gain_db = 0.5
+q = 1.0
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 500.0
+gain_db = 0.0
+q = 1.0
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 1000.0
+gain_db = -0.5
+q = 1.0
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 2000.0
+gain_db = 0.0
+q = 1.0
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 4000.0
+gain_db = -0.5
+q = 1.0
+
+[[bands]]
+enabled = true
+filter_type = "HighShelf"
+freq_hz = 8000.0
+gain_db = -1.0
+q = 0.707
+
+[[bands]]
+enabled = true
+filter_type = "Peaking"
+freq_hz = 16000.0
+gain_db = -1.5
+q = 1.0

@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 const MAX_FRAME_SIZE: u32 = 65_536;
 
+pub const SYSTEM_AUDIO_INPUT_NAME: &str = "System audio (excluding leaneq)";
+
 #[derive(Debug)]
 pub enum ProtoError {
     Io(std::io::Error),
@@ -342,6 +344,40 @@ gain_db = 0.0
 q = 1.41
 "#;
         assert!(EqConfig::from_toml_str(invalid_frequency).is_err());
+    }
+
+    #[test]
+    fn bundled_presets_parse_and_validate() {
+        for (name, contents) in [
+            ("flat", include_str!("../../../presets/flat.toml")),
+            (
+                "bass_boost",
+                include_str!("../../../presets/bass_boost.toml"),
+            ),
+            (
+                "vocal_clarity",
+                include_str!("../../../presets/vocal_clarity.toml"),
+            ),
+            (
+                "podcast_voice",
+                include_str!("../../../presets/podcast_voice.toml"),
+            ),
+            (
+                "gaming_focus",
+                include_str!("../../../presets/gaming_focus.toml"),
+            ),
+            (
+                "warm_listening",
+                include_str!("../../../presets/warm_listening.toml"),
+            ),
+            (
+                "treble_tame",
+                include_str!("../../../presets/treble_tame.toml"),
+            ),
+        ] {
+            EqConfig::from_toml_str(contents)
+                .unwrap_or_else(|error| panic!("preset {name} is invalid: {error}"));
+        }
     }
 
     #[test]

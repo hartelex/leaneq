@@ -158,39 +158,79 @@ fn find_output_device(host: &Host, needle: &str) -> Result<Device, String> {
     Err(format!("output device matching \"{needle}\" was not found"))
 }
 
-fn ensure_stereo_f32(device: &Device, output: bool) -> Result<(), String> {
-    let mut found_stereo = false;
-    let mut found_f32 = false;
+fn stereo_f32_sample_rates(device: &Device, output: bool) -> Result<Vec<(u32, u32)>, String> {
+    let ranges = if output {
+        device
+            .supported_output_configs()
+            .map_err(|error| error.to_string())?
+            .filter(|range| range.channels() == 2 && range.sample_format() == SampleFormat::F32)
+            .map(|range| (range.min_sample_rate().0, range.max_sample_rate().0))
+            .collect::<Vec<_>>()
+    } else {
+        device
+            .supported_input_configs()
+            .map_err(|error| error.to_string())?
+            .filter(|range| range.channels() == 2 && range.sample_format() == SampleFormat::F32)
+            .map(|range| (range.min_sample_rate().0, range.max_sample_rate().0))
+            .collect::<Vec<_>>()
+    };
 
-    if output {
-        if let Ok(configs) = device.supported_output_configs() {
-            for range in configs {
-                if range.channels() == 2 {
-                    found_stereo = true;
-                }
-                if range.channels() == 2 && range.sample_format() == SampleFormat::F32 {
-                    found_f32 = true;
+    if ranges.is_empty() {
+        return Err("selected device does not report stereo 32-bit floating-point support".into());
+    }
+    Ok(ranges)
+}
+
+fn supports_sample_rate(ranges: &[(u32, u32)], sample_rate: u32) -> bool {
+    ranges
+        .iter()
+        .any(|(min_rate, max_rate)| (*min_rate..=*max_rate).contains(&sample_rate))
+}
+
+fn choose_sample_rate(
+    input_ranges: &[(u32, u32)],
+    output_ranges: &[(u32, u32)],
+    preferred_rate: u32,
+    requested_rate: Option<u32>,
+) -> Result<u32, String> {
+    if let Some(sample_rate) = requested_rate {
+        if sample_rate > 0
+            && supports_sample_rate(input_ranges, sample_rate)
+            && supports_sample_rate(output_ranges, sample_rate)
+        {
+            return Ok(sample_rate);
+        }
+        return Err(format!(
+            "requested sample rate {sample_rate} Hz is not supported by both devices as stereo f32"
+        ));
+    }
+
+    if supports_sample_rate(input_ranges, preferred_rate)
+        && supports_sample_rate(output_ranges, preferred_rate)
+    {
+        return Ok(preferred_rate);
+    }
+
+    let mut best_rate = None;
+    let mut best_distance = u32::MAX;
+    for (input_min, input_max) in input_ranges {
+        for (output_min, output_max) in output_ranges {
+            let min_rate = (*input_min).max(*output_min);
+            let max_rate = (*input_max).min(*output_max);
+            if min_rate <= max_rate {
+                let candidate = preferred_rate.clamp(min_rate, max_rate);
+                let distance = candidate.abs_diff(preferred_rate);
+                if distance < best_distance {
+                    best_rate = Some(candidate);
+                    best_distance = distance;
                 }
             }
         }
-    } else if let Ok(configs) = device.supported_input_configs() {
-        for range in configs {
-            if range.channels() == 2 {
-                found_stereo = true;
-            }
-            if range.channels() == 2 && range.sample_format() == SampleFormat::F32 {
-                found_f32 = true;
-            }
-        }
     }
 
-    if !found_stereo {
-        return Err("selected device does not report stereo support".into());
-    }
-    if !found_f32 {
-        return Err("selected device does not report 32-bit floating-point stereo support".into());
-    }
-    Ok(())
+    best_rate.ok_or_else(|| {
+        "selected input and output devices have no shared stereo f32 sample rate".into()
+    })
 }
 
 fn ipc_thread(
@@ -334,16 +374,18 @@ pub fn run(args: EngineOptions) -> Result<(), String> {
     };
     let output_name = output_device.name().map_err(|error| error.to_string())?;
 
-    ensure_stereo_f32(&input_device, false)?;
-    ensure_stereo_f32(&output_device, true)?;
+    let input_sample_rates = stereo_f32_sample_rates(&input_device, false)?;
+    let output_sample_rates = stereo_f32_sample_rates(&output_device, true)?;
 
     let output_default = output_device
         .default_output_config()
         .map_err(|error| error.to_string())?;
-    let sample_rate = args.sample_rate.unwrap_or(output_default.sample_rate().0);
-    if sample_rate == 0 {
-        return Err("sample rate must be greater than zero".into());
-    }
+    let sample_rate = choose_sample_rate(
+        &input_sample_rates,
+        &output_sample_rates,
+        output_default.sample_rate().0,
+        args.sample_rate,
+    )?;
 
     let stream_config = StreamConfig {
         channels: 2,
@@ -359,7 +401,7 @@ pub fn run(args: EngineOptions) -> Result<(), String> {
         ring_capacity += 1;
     }
 
-    let (mut producer, mut consumer) = RingBuffer::<f32>::new(ring_capacity);
+    let (producer, mut consumer) = RingBuffer::<f32>::new(ring_capacity);
     let initial_config = EqConfig::default();
     let initial_snapshot = DspSnapshot::from_config(&initial_config, sample_rate)
         .map_err(|error| error.to_string())?;
@@ -368,6 +410,7 @@ pub fn run(args: EngineOptions) -> Result<(), String> {
     let underruns = Arc::new(AtomicU64::new(0));
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    let mut producer = producer;
     let underruns_input = Arc::clone(&underruns);
     let input_stream = input_device
         .build_input_stream(
@@ -391,7 +434,7 @@ pub fn run(args: EngineOptions) -> Result<(), String> {
             },
             None,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("failed to open stereo f32 input at {sample_rate} Hz: {error}"))?;
 
     let underruns_output = Arc::clone(&underruns);
     let underruns_output_error = Arc::clone(&underruns_output);
@@ -439,7 +482,9 @@ pub fn run(args: EngineOptions) -> Result<(), String> {
             },
             None,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| {
+            format!("failed to open stereo f32 output at {sample_rate} Hz: {error}")
+        })?;
 
     input_stream.play().map_err(|error| error.to_string())?;
     output_stream.play().map_err(|error| error.to_string())?;
@@ -474,4 +519,28 @@ pub fn run(args: EngineOptions) -> Result<(), String> {
     drop(output_stream);
     let _ = ipc_thread.join();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chooses_a_shared_rate_when_the_preferred_rate_is_unsupported() {
+        let input_rates = [(48_000, 96_000)];
+        let output_rates = [(44_100, 48_000)];
+
+        assert_eq!(
+            choose_sample_rate(&input_rates, &output_rates, 44_100, None),
+            Ok(48_000)
+        );
+    }
+
+    #[test]
+    fn rejects_an_explicit_rate_not_supported_by_both_devices() {
+        let input_rates = [(48_000, 96_000)];
+        let output_rates = [(44_100, 48_000)];
+
+        assert!(choose_sample_rate(&input_rates, &output_rates, 48_000, Some(44_100)).is_err());
+    }
 }

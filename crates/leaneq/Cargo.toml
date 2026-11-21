@@ -13,3 +13,6 @@ leaneq-engine = { path = "../leaneq-engine" }
 leaneq-ui = { path = "../leaneq-ui" }
 leaneq-tray = { path = "../leaneq-tray" }
 leaneq-proto = { path = "../leaneq-proto" }
+
+[build-dependencies]
+winresource = { version = "0.1.34", default-features = false }

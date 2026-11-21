@@ -4,12 +4,15 @@
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 use interprocess::local_socket::{prelude::*, GenericNamespaced};
+#[cfg(windows)]
+use leaneq_proto::SYSTEM_AUDIO_INPUT_NAME;
 use leaneq_proto::{EngineSettings, EqConfig, IpcCommand, IpcResponse};
 
 #[derive(Debug, Parser)]
@@ -126,6 +129,22 @@ fn initialize_files(directory: &Path) -> Result<(PathBuf, PathBuf), String> {
             "vocal_clarity.toml",
             include_str!("../../../presets/vocal_clarity.toml"),
         ),
+        (
+            "podcast_voice.toml",
+            include_str!("../../../presets/podcast_voice.toml"),
+        ),
+        (
+            "gaming_focus.toml",
+            include_str!("../../../presets/gaming_focus.toml"),
+        ),
+        (
+            "warm_listening.toml",
+            include_str!("../../../presets/warm_listening.toml"),
+        ),
+        (
+            "treble_tame.toml",
+            include_str!("../../../presets/treble_tame.toml"),
+        ),
     ] {
         let path = presets_dir.join(name);
         if !path.exists() {
@@ -164,12 +183,25 @@ fn ping_engine() -> bool {
     matches!(exchange(&IpcCommand::Ping), Ok(IpcResponse::Pong))
 }
 
-fn launch_daemon(executable: &Path, settings: &EngineSettings) -> Result<(), String> {
+fn engine_matches_capture_mode() -> bool {
+    #[cfg(windows)]
+    {
+        matches!(
+            exchange(&IpcCommand::GetStatus),
+            Ok(IpcResponse::Status(status)) if status.input_device != SYSTEM_AUDIO_INPUT_NAME
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        ping_engine()
+    }
+}
+
+fn launch_daemon(executable: &Path, settings: &EngineSettings) -> Result<Child, String> {
     let mut command = Command::new(executable);
+    command.arg("daemon");
+    command.arg("--input").arg(&settings.input_device);
     command
-        .arg("daemon")
-        .arg("--input")
-        .arg(&settings.input_device)
         .arg("--output")
         .arg(&settings.output_device)
         .arg("--latency-ms")
@@ -181,21 +213,64 @@ fn launch_daemon(executable: &Path, settings: &EngineSettings) -> Result<(), Str
     }
     configure_hidden_process(&mut command);
     command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
 fn ensure_engine(executable: &Path, settings: &EngineSettings) -> Result<(), String> {
-    if !ping_engine() {
-        launch_daemon(executable, settings)?;
-    }
+    let mut daemon = if engine_matches_capture_mode() {
+        None
+    } else {
+        if ping_engine() {
+            match exchange(&IpcCommand::Shutdown)? {
+                IpcResponse::Ok => {}
+                IpcResponse::Error(error) => return Err(error),
+                _ => return Err("the engine returned an unexpected response".into()),
+            }
+            let shutdown_start = Instant::now();
+            while ping_engine() && shutdown_start.elapsed() < Duration::from_millis(1500) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if ping_engine() {
+                return Err("the previous audio engine did not stop".into());
+            }
+        }
+        Some(launch_daemon(executable, settings)?)
+    };
     let start = Instant::now();
     while start.elapsed() < Duration::from_millis(1500) {
         if ping_engine() {
             return Ok(());
         }
+        if let Some(daemon) = &mut daemon {
+            if let Some(status) = daemon.try_wait().map_err(|error| error.to_string())? {
+                let mut error = String::new();
+                if let Some(mut stderr) = daemon.stderr.take() {
+                    stderr
+                        .read_to_string(&mut error)
+                        .map_err(|error| error.to_string())?;
+                }
+                let error = error.trim();
+                return if error.is_empty() {
+                    Err(format!("the audio engine exited with status {status}"))
+                } else {
+                    Err(error.to_string())
+                };
+            }
+        }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(mut daemon) = daemon {
+        if daemon
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            daemon.kill().map_err(|error| error.to_string())?;
+            daemon.wait().map_err(|error| error.to_string())?;
+        }
     }
     Err("the audio engine did not start within 1500 ms".into())
 }
@@ -212,6 +287,18 @@ fn load_startup_preset(presets_dir: &Path, settings: &EngineSettings) -> Result<
     }
 }
 
+fn stop_engine() -> Result<(), String> {
+    if !ping_engine() {
+        return Ok(());
+    }
+
+    match exchange(&IpcCommand::Shutdown)? {
+        IpcResponse::Ok => Ok(()),
+        IpcResponse::Error(error) => Err(error),
+        _ => Err("the engine returned an unexpected response while shutting down".into()),
+    }
+}
+
 fn run_tray() -> Result<(), String> {
     let Some(_mutex) = acquire_tray_mutex()? else {
         return Ok(());
@@ -220,10 +307,26 @@ fn run_tray() -> Result<(), String> {
     let (presets_dir, settings_path) = initialize_files(&directory)?;
     let settings = load_settings(&settings_path)?;
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
-    if ensure_engine(&executable, &settings).is_ok() {
-        let _ = load_startup_preset(&presets_dir, &settings);
+    let startup_error = match ensure_engine(&executable, &settings) {
+        Ok(()) => load_startup_preset(&presets_dir, &settings).err(),
+        Err(error) => Some(error),
+    };
+    let tray_result = leaneq_tray::run(
+        "leaneq".to_string(),
+        presets_dir,
+        settings_path,
+        executable,
+        startup_error,
+    );
+    let shutdown_result = stop_engine();
+
+    match (tray_result, shutdown_result) {
+        (Ok(()), result) => result,
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(shutdown_error)) => Err(format!(
+            "{error}; additionally failed to stop the audio engine: {shutdown_error}"
+        )),
     }
-    leaneq_tray::run("leaneq".to_string(), presets_dir, settings_path, executable)
 }
 
 fn run_daemon(args: &[OsString]) -> Result<(), String> {
@@ -238,7 +341,7 @@ fn run_daemon(args: &[OsString]) -> Result<(), String> {
         std::iter::once(OsString::from("leaneq-daemon")).chain(args.iter().skip(1).cloned());
     let args = DaemonArgs::try_parse_from(parser_args).map_err(|error| error.to_string())?;
 
-    leaneq_engine::run(leaneq_engine::EngineOptions::new(
+    let options = leaneq_engine::EngineOptions::new(
         args.input.unwrap_or(settings.input_device),
         args.output.or({
             if settings.output_device.is_empty() {
@@ -250,7 +353,8 @@ fn run_daemon(args: &[OsString]) -> Result<(), String> {
         args.latency_ms.unwrap_or(settings.latency_ms),
         args.sample_rate.or(settings.sample_rate),
         args.pipe.unwrap_or_else(|| "leaneq".to_string()),
-    ))
+    );
+    leaneq_engine::run(options)
 }
 
 fn run_cli(args: &[OsString]) -> Result<(), String> {

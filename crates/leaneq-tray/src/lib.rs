@@ -1,12 +1,15 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use interprocess::local_socket::{prelude::*, GenericNamespaced};
 use leaneq_proto::{
     read_frame, write_frame, EngineSettings, EngineStatus, EqConfig, IpcCommand, IpcResponse,
 };
+#[cfg(windows)]
+use muda::ContextMenu;
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use winit::application::ApplicationHandler;
@@ -20,6 +23,7 @@ struct TrayState {
     executable_path: PathBuf,
     settings: EngineSettings,
     status: Option<EngineStatus>,
+    engine_error: Option<String>,
     inputs: Vec<String>,
     outputs: Vec<String>,
     last_loaded_preset: Option<PathBuf>,
@@ -42,6 +46,9 @@ impl TrayState {
             _ => None,
         };
         self.status = status.clone();
+        if status.is_some() {
+            self.engine_error = None;
+        }
         status
     }
 
@@ -80,7 +87,7 @@ impl TrayState {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        spawn_engine(&self.executable_path, &self.settings, &self.pipe)?;
+        let mut daemon = spawn_engine(&self.executable_path, &self.settings, &self.pipe)?;
 
         for _ in 0..30 {
             if matches!(
@@ -113,18 +120,39 @@ impl TrayState {
                 }
                 return Ok(());
             }
+            if let Some(status) = daemon.try_wait().map_err(|error| error.to_string())? {
+                let mut error = String::new();
+                if let Some(mut stderr) = daemon.stderr.take() {
+                    stderr
+                        .read_to_string(&mut error)
+                        .map_err(|error| error.to_string())?;
+                }
+                let error = error.trim();
+                return if error.is_empty() {
+                    Err(format!("the audio engine exited with status {status}"))
+                } else {
+                    Err(error.to_string())
+                };
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if daemon
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            daemon.kill().map_err(|error| error.to_string())?;
+            daemon.wait().map_err(|error| error.to_string())?;
         }
         Err("failed to restart the audio engine".into())
     }
 }
 
-fn spawn_engine(executable: &Path, settings: &EngineSettings, pipe: &str) -> Result<(), String> {
+fn spawn_engine(executable: &Path, settings: &EngineSettings, pipe: &str) -> Result<Child, String> {
     let mut command = Command::new(executable);
+    command.arg("daemon");
+    command.arg("--input").arg(&settings.input_device);
     command
-        .arg("daemon")
-        .arg("--input")
-        .arg(&settings.input_device)
         .arg("--output")
         .arg(&settings.output_device)
         .arg("--latency-ms")
@@ -140,8 +168,9 @@ fn spawn_engine(executable: &Path, settings: &EngineSettings, pipe: &str) -> Res
         command.creation_flags(0x0800_0000);
     }
     command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -194,6 +223,7 @@ fn scan_presets(directory: &Path) -> Vec<(String, PathBuf)> {
     presets
 }
 
+#[cfg(not(windows))]
 fn generate_icon() -> [u8; 32 * 32 * 4] {
     let mut rgba = [0u8; 32 * 32 * 4];
     for y in 0..32usize {
@@ -241,7 +271,10 @@ fn build_menu(state: &TrayState) -> Menu {
 
     let status_text = match &state.status {
         Some(status) => format!("leaneq: Connected ({} Hz)", status.sample_rate),
-        None => "leaneq: Disconnected".to_string(),
+        None => state.engine_error.as_ref().map_or_else(
+            || "leaneq: Disconnected".to_string(),
+            |error| format!("leaneq: Disconnected ({error})"),
+        ),
     };
     let _ = menu.append(&MenuItem::new(status_text, false, None));
     let _ = menu.append(&PredefinedMenuItem::separator());
@@ -258,13 +291,12 @@ fn build_menu(state: &TrayState) -> Menu {
     let inputs_menu = Submenu::with_id("input-devices", "Input device", true);
     for (index, device) in state.inputs.iter().enumerate() {
         let id = format!("input:{index}");
-        let _ = inputs_menu.append(&CheckMenuItem::with_id(
-            id,
-            device,
-            true,
-            device == &state.settings.input_device,
-            None,
-        ));
+        let checked = device == &state.settings.input_device
+            || state
+                .status
+                .as_ref()
+                .is_some_and(|status| status.input_device == *device);
+        let _ = inputs_menu.append(&CheckMenuItem::with_id(id, device, true, checked, None));
     }
     let _ = menu.append(&inputs_menu);
 
@@ -329,18 +361,6 @@ fn build_menu(state: &TrayState) -> Menu {
         None,
     ));
     let _ = menu.append(&PredefinedMenuItem::separator());
-    let _ = menu.append(&MenuItem::with_id(
-        "stop-engine",
-        "Stop audio engine",
-        true,
-        None,
-    ));
-    let _ = menu.append(&MenuItem::with_id(
-        "start-engine",
-        "Start audio engine",
-        state.status.is_none(),
-        None,
-    ));
     let _ = menu.append(&MenuItem::with_id("close-tray", "Exit tray", true, None));
     menu
 }
@@ -354,9 +374,10 @@ fn run_action(state: &mut TrayState, menu_id: &MenuId) -> Option<bool> {
         if let Some(device) = state.inputs.get(index) {
             let previous = state.status.as_ref().map(|status| status.config.clone());
             state.settings.input_device.clone_from(device);
-            if state.save_settings().is_ok() {
-                let _ = state.restart_engine(previous);
-            }
+            state.engine_error = state
+                .save_settings()
+                .and_then(|()| state.restart_engine(previous))
+                .err();
         }
         return None;
     }
@@ -372,9 +393,10 @@ fn run_action(state: &mut TrayState, menu_id: &MenuId) -> Option<bool> {
                 }
             }
         }
-        if state.save_settings().is_ok() {
-            let _ = state.restart_engine(previous);
-        }
+        state.engine_error = state
+            .save_settings()
+            .and_then(|()| state.restart_engine(previous))
+            .err();
         return None;
     }
     match id {
@@ -389,16 +411,6 @@ fn run_action(state: &mut TrayState, menu_id: &MenuId) -> Option<bool> {
         "refresh" => None,
         "open-presets" => {
             let _ = Command::new("explorer").arg(&state.presets_dir).spawn();
-            None
-        }
-        "stop-engine" => {
-            let _ = exchange(&state.pipe, &IpcCommand::Shutdown);
-            state.status = None;
-            None
-        }
-        "start-engine" => {
-            let current = state.status.as_ref().map(|status| status.config.clone());
-            let _ = state.restart_engine(current);
             None
         }
         "close-tray" => Some(true),
@@ -468,7 +480,14 @@ impl ApplicationHandler for Handler {
                 state.refresh_status();
                 let menu = build_menu(state);
                 if let Some(tray) = &self.tray {
-                    tray.set_menu(Some(Box::new(menu)));
+                    tray.set_menu(Some(Box::new(menu.clone())));
+                    #[cfg(windows)]
+                    if !should_close {
+                        // SAFETY: tray.window_handle() is the live HWND owned by this TrayIcon.
+                        unsafe {
+                            menu.show_context_menu_for_hwnd(tray.window_handle() as isize, None);
+                        }
+                    }
                 }
             }
             if should_close {
@@ -483,6 +502,7 @@ pub fn run(
     requested_presets_dir: PathBuf,
     settings_path: PathBuf,
     executable_path: PathBuf,
+    startup_error: Option<String>,
 ) -> Result<(), String> {
     let presets_dir = resolve_presets_dir(&requested_presets_dir);
     let settings = fs::read_to_string(&settings_path)
@@ -501,6 +521,7 @@ pub fn run(
         executable_path,
         settings,
         status: None,
+        engine_error: startup_error,
         inputs: Vec::new(),
         outputs: Vec::new(),
         last_loaded_preset,
@@ -514,10 +535,13 @@ pub fn run(
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let menu = build_menu(&state);
-    let icon_rgba = generate_icon();
-    let icon = match tray_icon::Icon::from_rgba(icon_rgba.to_vec(), 32, 32) {
-        Ok(icon) => icon,
-        Err(error) => return Err(error.to_string()),
+    #[cfg(windows)]
+    let icon =
+        tray_icon::Icon::from_resource(1, Some((32, 32))).map_err(|error| error.to_string())?;
+    #[cfg(not(windows))]
+    let icon = {
+        let icon_rgba = generate_icon();
+        tray_icon::Icon::from_rgba(icon_rgba.to_vec(), 32, 32).map_err(|error| error.to_string())?
     };
     let tray = match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
