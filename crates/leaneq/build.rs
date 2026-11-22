@@ -18,7 +18,7 @@ fn main() {
                     .to_str()
                     .expect("icon path must be valid UTF-8 for the resource compiler"),
             )
-            .set("FileDescription", "an equalizer program that's lightweight")
+            .set("FileDescription", "leaneq")
             .set("ProductName", "leaneq")
             .set("CompanyName", "hartelex")
             .set("LegalCopyright", "Copyright © 2026 hartelex")

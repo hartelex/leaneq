@@ -31,5 +31,4 @@ bundled presets include flat, bass boost, vocal clarity, podcast voice, gaming f
 
 - import presets instead of presets folder
 - program autoupdate with new release
-- start with windows
 - per-application routing?
