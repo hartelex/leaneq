@@ -26,6 +26,10 @@ to equalize windows system playback without doubling it, route playback through 
 
 bundled presets include flat, bass boost, vocal clarity, podcast voice, gaming focus, warm listening, and treble tame. they're starting points, so tweak them to suit your headphones and ears. preset files live in the `presets` folder beside the executable.
 
+## license
+
+leaneq is licensed under the GNU General Public License v3.0 only. See [LICENSE](LICENSE).
+
 
 ## what am i working on next
 

@@ -22,7 +22,10 @@ fn main() {
             .set("ProductName", "leaneq")
             .set("CompanyName", "hartelex")
             .set("LegalCopyright", "Copyright © 2026 hartelex")
-            .set("Comments", "https://github.com/hartelex/leaneq")
+            .set(
+                "Comments",
+                "Licensed under GPL-3.0-only; https://github.com/hartelex/leaneq",
+            )
             .set("InternalName", "leaneq")
             .set("OriginalFilename", "leaneq.exe")
             .set("FileVersion", &version)

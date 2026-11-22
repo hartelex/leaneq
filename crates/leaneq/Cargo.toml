@@ -3,6 +3,7 @@ name = "leaneq"
 version = "1.0.1"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 clap.workspace = true

@@ -12,6 +12,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 rust-version = "1.82"
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 cpal = "0.16"
