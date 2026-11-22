@@ -16,6 +16,11 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 
+#[cfg(windows)]
+const STARTUP_REGISTRY_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+#[cfg(windows)]
+const STARTUP_REGISTRY_VALUE: &str = "leaneq";
+
 struct TrayState {
     pipe: String,
     presets_dir: PathBuf,
@@ -25,6 +30,10 @@ struct TrayState {
     status: Option<EngineStatus>,
     engine_error: Option<String>,
     preset_error: Option<String>,
+    #[cfg(windows)]
+    startup_error: Option<String>,
+    #[cfg(windows)]
+    start_with_windows: bool,
     inputs: Vec<String>,
     outputs: Vec<String>,
     last_loaded_preset: Option<PathBuf>,
@@ -185,6 +194,207 @@ fn exchange(pipe_name: &str, command: &IpcCommand) -> Result<IpcResponse, String
     read_frame(&mut stream).map_err(|error| error.to_string())
 }
 
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+fn startup_command(executable: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let mut command = vec![b'"' as u16];
+    command.extend(executable.as_os_str().encode_wide());
+    command.push(b'"' as u16);
+    command.push(0);
+    command
+}
+
+#[cfg(windows)]
+fn startup_registration_enabled() -> Result<bool, String> {
+    use std::ffi::c_void;
+
+    type Hkey = *mut c_void;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegOpenKeyExW(
+            key: Hkey,
+            subkey: *const u16,
+            options: u32,
+            access: u32,
+            result: *mut Hkey,
+        ) -> i32;
+        fn RegQueryValueExW(
+            key: Hkey,
+            value_name: *const u16,
+            reserved: *mut u32,
+            value_type: *mut u32,
+            data: *mut u8,
+            data_size: *mut u32,
+        ) -> i32;
+        fn RegCloseKey(key: Hkey) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: Hkey = 0x8000_0001usize as Hkey;
+    const KEY_QUERY_VALUE: u32 = 0x0001;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+
+    let subkey = wide_null(STARTUP_REGISTRY_KEY);
+    let mut key = std::ptr::null_mut();
+    // SAFETY: subkey is NUL-terminated, key is a valid output pointer, and the predefined
+    // HKEY_CURRENT_USER handle is valid for RegOpenKeyExW.
+    let result = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    };
+    if result == ERROR_FILE_NOT_FOUND {
+        return Ok(false);
+    }
+    if result != 0 {
+        return Err(format!(
+            "could not read Windows startup registration (error {result})"
+        ));
+    }
+
+    let value_name = wide_null(STARTUP_REGISTRY_VALUE);
+    // SAFETY: key is an open registry handle, value_name is NUL-terminated, and null data
+    // pointers request only the value's metadata.
+    let result = unsafe {
+        RegQueryValueExW(
+            key,
+            value_name.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    // SAFETY: key was successfully opened above and is closed exactly once here.
+    unsafe {
+        RegCloseKey(key);
+    }
+    match result {
+        0 => Ok(true),
+        ERROR_FILE_NOT_FOUND => Ok(false),
+        _ => Err(format!(
+            "could not read Windows startup registration (error {result})"
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn set_startup_registration(enabled: bool, executable: &Path) -> Result<(), String> {
+    use std::ffi::c_void;
+
+    type Hkey = *mut c_void;
+
+    #[link(name = "advapi32")]
+    unsafe extern "system" {
+        fn RegCreateKeyExW(
+            key: Hkey,
+            subkey: *const u16,
+            reserved: u32,
+            class: *mut u16,
+            options: u32,
+            access: u32,
+            security_attributes: *mut c_void,
+            result: *mut Hkey,
+            disposition: *mut u32,
+        ) -> i32;
+        fn RegSetValueExW(
+            key: Hkey,
+            value_name: *const u16,
+            reserved: u32,
+            value_type: u32,
+            data: *const u8,
+            data_size: u32,
+        ) -> i32;
+        fn RegDeleteValueW(key: Hkey, value_name: *const u16) -> i32;
+        fn RegCloseKey(key: Hkey) -> i32;
+    }
+
+    const HKEY_CURRENT_USER: Hkey = 0x8000_0001usize as Hkey;
+    const KEY_SET_VALUE: u32 = 0x0002;
+    const REG_OPTION_NON_VOLATILE: u32 = 0;
+    const REG_SZ: u32 = 1;
+    const ERROR_FILE_NOT_FOUND: i32 = 2;
+
+    let command = if enabled {
+        Some(startup_command(executable))
+    } else {
+        None
+    };
+    let data_size = command
+        .as_ref()
+        .map(|command| {
+            u32::try_from(command.len() * std::mem::size_of::<u16>())
+                .map_err(|_| "startup command is too long".to_string())
+        })
+        .transpose()?;
+
+    let subkey = wide_null(STARTUP_REGISTRY_KEY);
+    let mut key = std::ptr::null_mut();
+    let mut disposition = 0;
+    // SAFETY: subkey is NUL-terminated; key and disposition are valid output pointers; the
+    // predefined HKEY_CURRENT_USER handle is valid for RegCreateKeyExW.
+    let result = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            std::ptr::null_mut(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null_mut(),
+            &mut key,
+            &mut disposition,
+        )
+    };
+    if result != 0 {
+        return Err(format!(
+            "could not update Windows startup registration (error {result})"
+        ));
+    }
+
+    let value_name = wide_null(STARTUP_REGISTRY_VALUE);
+    let result = if enabled {
+        let command = command.expect("startup command created when enabled");
+        let data_size = data_size.expect("startup command byte length calculated");
+        // SAFETY: key is open, value_name and command are NUL-terminated UTF-16 strings, and
+        // the byte length matches the initialized command buffer.
+        unsafe {
+            RegSetValueExW(
+                key,
+                value_name.as_ptr(),
+                0,
+                REG_SZ,
+                command.as_ptr().cast(),
+                data_size,
+            )
+        }
+    } else {
+        // SAFETY: key is open and value_name is NUL-terminated.
+        unsafe { RegDeleteValueW(key, value_name.as_ptr()) }
+    };
+    // SAFETY: key was successfully opened above and is closed exactly once here.
+    unsafe {
+        RegCloseKey(key);
+    }
+    if result == 0 || (!enabled && result == ERROR_FILE_NOT_FOUND) {
+        Ok(())
+    } else {
+        Err(format!(
+            "could not update Windows startup registration (error {result})"
+        ))
+    }
+}
+
 fn resolve_presets_dir(requested: &Path) -> PathBuf {
     if requested.is_dir() {
         return requested.to_path_buf();
@@ -280,6 +490,10 @@ fn build_menu(state: &TrayState) -> Menu {
     if let Some(error) = &state.preset_error {
         status_text.push_str(&format!(" - preset error: {error}"));
     }
+    #[cfg(windows)]
+    if let Some(error) = &state.startup_error {
+        status_text.push_str(&format!(" - startup error: {error}"));
+    }
     let _ = menu.append(&MenuItem::new(status_text, false, None));
     if let Some(status) = &state.status {
         let _ = menu.append(&MenuItem::new(
@@ -374,6 +588,17 @@ fn build_menu(state: &TrayState) -> Menu {
         true,
         None,
     ));
+    #[cfg(windows)]
+    {
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&CheckMenuItem::with_id(
+            "start-with-windows",
+            "Start with Windows",
+            true,
+            state.start_with_windows,
+            None,
+        ));
+    }
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&MenuItem::with_id("close-tray", "Exit tray", true, None));
     menu
@@ -425,6 +650,18 @@ fn run_action(state: &mut TrayState, menu_id: &MenuId) -> Option<bool> {
         "refresh" => None,
         "open-presets" => {
             let _ = Command::new("explorer").arg(&state.presets_dir).spawn();
+            None
+        }
+        #[cfg(windows)]
+        "start-with-windows" => {
+            let enabled = !state.start_with_windows;
+            match set_startup_registration(enabled, &state.executable_path) {
+                Ok(()) => {
+                    state.start_with_windows = enabled;
+                    state.startup_error = None;
+                }
+                Err(error) => state.startup_error = Some(error),
+            }
             None
         }
         "close-tray" => Some(true),
@@ -542,6 +779,11 @@ pub fn run(
     } else {
         Some(presets_dir.join(format!("{}.toml", settings.last_preset)))
     };
+    #[cfg(windows)]
+    let (start_with_windows, startup_registration_error) = match startup_registration_enabled() {
+        Ok(enabled) => (enabled, None),
+        Err(error) => (false, Some(error)),
+    };
     let mut state = TrayState {
         pipe,
         presets_dir,
@@ -551,6 +793,10 @@ pub fn run(
         status: None,
         engine_error: startup_error,
         preset_error: None,
+        #[cfg(windows)]
+        startup_error: startup_registration_error,
+        #[cfg(windows)]
+        start_with_windows,
         inputs: Vec::new(),
         outputs: Vec::new(),
         last_loaded_preset,
@@ -589,4 +835,18 @@ pub fn run(
     event_loop
         .run_app(&mut handler)
         .map_err(|error| error.to_string())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_command_quotes_executable_paths_with_spaces() {
+        let command = startup_command(Path::new(r"C:\Program Files\leaneq\leaneq.exe"));
+        let command = String::from_utf16(&command[..command.len() - 1])
+            .expect("startup command should be valid UTF-16");
+
+        assert_eq!(command, r#""C:\Program Files\leaneq\leaneq.exe""#);
+    }
 }
