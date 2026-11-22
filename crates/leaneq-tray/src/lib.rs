@@ -24,6 +24,7 @@ struct TrayState {
     settings: EngineSettings,
     status: Option<EngineStatus>,
     engine_error: Option<String>,
+    preset_error: Option<String>,
     inputs: Vec<String>,
     outputs: Vec<String>,
     last_loaded_preset: Option<PathBuf>,
@@ -269,14 +270,27 @@ fn generate_icon() -> [u8; 32 * 32 * 4] {
 fn build_menu(state: &TrayState) -> Menu {
     let menu = Menu::new();
 
-    let status_text = match &state.status {
+    let mut status_text = match &state.status {
         Some(status) => format!("leaneq: Connected ({} Hz)", status.sample_rate),
         None => state.engine_error.as_ref().map_or_else(
             || "leaneq: Disconnected".to_string(),
             |error| format!("leaneq: Disconnected ({error})"),
         ),
     };
+    if let Some(error) = &state.preset_error {
+        status_text.push_str(&format!(" - preset error: {error}"));
+    }
     let _ = menu.append(&MenuItem::new(status_text, false, None));
+    if let Some(status) = &state.status {
+        let _ = menu.append(&MenuItem::new(
+            format!(
+                "Routing: {} -> {}",
+                status.input_device, status.output_device
+            ),
+            false,
+            None,
+        ));
+    }
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let bypass = state
@@ -416,28 +430,42 @@ fn run_action(state: &mut TrayState, menu_id: &MenuId) -> Option<bool> {
         "close-tray" => Some(true),
         preset_id if preset_id.starts_with("preset:") => {
             let preset_path = PathBuf::from(preset_id.trim_start_matches("preset:"));
-            if preset_path.is_file() {
-                if let Ok(text) = fs::read_to_string(&preset_path) {
-                    if let Ok(config) = EqConfig::from_toml_str(&text) {
-                        if let Ok(IpcResponse::Ok) =
-                            exchange(&state.pipe, &IpcCommand::SetConfig(config))
-                        {
-                            state.last_loaded_preset = Some(preset_path);
-                            if let Some(path) = &state.last_loaded_preset {
-                                if let Some(name) = path.file_stem().and_then(|stem| stem.to_str())
-                                {
-                                    state.settings.last_preset = name.to_string();
-                                    let _ = state.save_settings();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            state.preset_error = apply_preset(state, preset_path).err();
             None
         }
         _ => None,
     }
+}
+
+fn apply_preset(state: &mut TrayState, path: PathBuf) -> Result<(), String> {
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let config = EqConfig::from_toml_str(&text)
+        .map_err(|error| format!("invalid preset {}: {error}", path.display()))?;
+
+    match exchange(&state.pipe, &IpcCommand::SetConfig(config.clone()))? {
+        IpcResponse::Ok => {}
+        IpcResponse::Error(error) => return Err(format!("engine rejected preset: {error}")),
+        _ => return Err("engine returned an unexpected response while loading preset".into()),
+    }
+    match exchange(&state.pipe, &IpcCommand::GetStatus)? {
+        IpcResponse::Status(status) if status.config == config => {}
+        IpcResponse::Status(_) => {
+            return Err("engine did not report the selected preset as active".into());
+        }
+        IpcResponse::Error(error) => return Err(format!("could not verify preset: {error}")),
+        _ => return Err("engine returned an unexpected response while verifying preset".into()),
+    }
+
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| format!("could not determine preset name from {}", path.display()))?
+        .to_string();
+    state.last_loaded_preset = Some(path);
+    state.settings.last_preset = name;
+    state.save_settings()?;
+    Ok(())
 }
 
 #[derive(Default)]
@@ -522,6 +550,7 @@ pub fn run(
         settings,
         status: None,
         engine_error: startup_error,
+        preset_error: None,
         inputs: Vec::new(),
         outputs: Vec::new(),
         last_loaded_preset,

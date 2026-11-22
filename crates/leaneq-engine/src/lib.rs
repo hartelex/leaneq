@@ -526,6 +526,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn applying_a_preset_snapshot_changes_the_live_audio() {
+        let initial_config = EqConfig::default();
+        let initial_snapshot =
+            DspSnapshot::from_config(&initial_config, 48_000).expect("default config is valid");
+
+        let mut preset = EqConfig::default();
+        preset.bands[0] = leaneq_proto::BandConfig {
+            enabled: true,
+            filter_type: FilterType::LowShelf,
+            freq_hz: 100.0,
+            gain_db: 8.0,
+            q: 0.707,
+        };
+        let preset_snapshot =
+            DspSnapshot::from_config(&preset, 48_000).expect("test preset is valid");
+
+        let mut chain = AudioChain::new(&initial_snapshot);
+        chain.apply_snapshot(&preset_snapshot);
+
+        let mut input_energy = 0.0;
+        let mut output_energy = 0.0;
+        for sample_index in 0..48_000 {
+            let input = (core::f32::consts::TAU * 60.0 * sample_index as f32 / 48_000.0).sin();
+            let (output, _) = chain.process(input, input);
+            if sample_index >= 4_800 {
+                input_energy += input * input;
+                output_energy += output * output;
+            }
+        }
+
+        assert!(
+            output_energy > input_energy * 2.0,
+            "preset should audibly boost its target range"
+        );
+    }
+
+    #[test]
     fn chooses_a_shared_rate_when_the_preferred_rate_is_unsupported() {
         let input_rates = [(48_000, 96_000)];
         let output_rates = [(44_100, 48_000)];
