@@ -2,6 +2,10 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(windows)]
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+#[cfg(windows)]
+use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait};
 use interprocess::local_socket::{prelude::*, GenericNamespaced};
@@ -17,6 +21,9 @@ use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::ScreenToClient};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+
+#[cfg(windows)]
+mod updater;
 
 #[cfg(windows)]
 const STARTUP_REGISTRY_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -39,6 +46,8 @@ struct TrayState {
     inputs: Vec<String>,
     outputs: Vec<String>,
     last_loaded_preset: Option<PathBuf>,
+    update_notice: String,
+    pending_update: Option<PathBuf>,
 }
 
 impl TrayState {
@@ -488,6 +497,7 @@ struct PresetMenuItem {
 struct TrayMenu {
     menu: Menu,
     status_item: MenuItem,
+    update_item: MenuItem,
     routing_item: Option<MenuItem>,
     bypass_item: CheckMenuItem,
     inputs: Vec<(String, CheckMenuItem)>,
@@ -515,6 +525,7 @@ impl TrayMenu {
 
     fn update(&self, state: &TrayState) {
         self.status_item.set_text(status_text(state));
+        self.update_item.set_text(&state.update_notice);
         if let (Some(item), Some(status)) = (&self.routing_item, &state.status) {
             item.set_text(routing_text(status));
         }
@@ -772,6 +783,8 @@ fn build_menu(state: &TrayState) -> TrayMenu {
         true,
         None,
     ));
+    let update_item = MenuItem::new(&state.update_notice, false, None);
+    let _ = menu.append(&update_item);
     #[cfg(windows)]
     let start_with_windows_item = {
         let _ = menu.append(&PredefinedMenuItem::separator());
@@ -790,6 +803,7 @@ fn build_menu(state: &TrayState) -> TrayMenu {
     TrayMenu {
         menu,
         status_item,
+        update_item,
         routing_item,
         bypass_item,
         inputs,
@@ -908,6 +922,8 @@ struct Handler {
     tray: Option<tray_icon::TrayIcon>,
     menu: Option<TrayMenu>,
     #[cfg(windows)]
+    update_receiver: Option<Receiver<Result<Option<updater::StagedUpdate>, String>>>,
+    #[cfg(windows)]
     menu_position: Option<muda::dpi::PhysicalPosition<f64>>,
 }
 
@@ -945,6 +961,35 @@ impl ApplicationHandler for Handler {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(windows)]
+        {
+            let update_result =
+                self.update_receiver
+                    .as_ref()
+                    .and_then(|receiver| match receiver.try_recv() {
+                        Ok(result) => Some(result),
+                        Err(TryRecvError::Empty) => None,
+                        Err(TryRecvError::Disconnected) => {
+                            Some(Err("update checker stopped unexpectedly".into()))
+                        }
+                    });
+            if let Some(result) = update_result {
+                self.update_receiver = None;
+                if let Some(state) = &mut self.state {
+                    match result {
+                        Ok(Some(update)) => {
+                            state.update_notice =
+                                format!("Update {} - installs when you exit", update.version);
+                            state.pending_update = Some(update.executable);
+                        }
+                        Ok(None) => state.update_notice = "leaneq is up to date".into(),
+                        Err(error) => state.update_notice = format!("Update check failed: {error}"),
+                    }
+                }
+                self.update_menu(false);
+            }
+        }
+
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
             let click_position = match &event {
                 TrayIconEvent::Click { position, .. }
@@ -990,6 +1035,10 @@ impl ApplicationHandler for Handler {
                 event_loop.exit();
             }
         }
+        #[cfg(windows)]
+        event_loop.set_control_flow(ControlFlow::WaitUntil(
+            Instant::now() + Duration::from_secs(1),
+        ));
     }
 }
 
@@ -999,7 +1048,10 @@ pub fn run(
     settings_path: PathBuf,
     executable_path: PathBuf,
     startup_error: Option<String>,
-) -> Result<(), String> {
+    current_version: String,
+) -> Result<Option<PathBuf>, String> {
+    #[cfg(not(windows))]
+    let _ = current_version;
     let presets_dir = resolve_presets_dir(&requested_presets_dir);
     let settings = fs::read_to_string(&settings_path)
         .ok()
@@ -1031,8 +1083,37 @@ pub fn run(
         inputs: Vec::new(),
         outputs: Vec::new(),
         last_loaded_preset,
+        update_notice: if cfg!(windows) {
+            "Checking for updates...".into()
+        } else {
+            "Automatic updates are available on Windows only".into()
+        },
+        pending_update: None,
     };
     state.refresh_status();
+
+    #[cfg(windows)]
+    let update_receiver = if cfg!(debug_assertions) {
+        state.update_notice = "Automatic updates are disabled in development builds".into();
+        None
+    } else {
+        let (sender, receiver) = mpsc::channel();
+        let executable_path = state.executable_path.clone();
+        match std::thread::Builder::new()
+            .name("leaneq-update-check".into())
+            .spawn(move || {
+                let _ = sender.send(updater::check_for_update(
+                    &current_version,
+                    &executable_path,
+                ));
+            }) {
+            Ok(_) => Some(receiver),
+            Err(error) => {
+                state.update_notice = format!("Could not start update check: {error}");
+                None
+            }
+        }
+    };
 
     let event_loop = match EventLoop::new() {
         Ok(event_loop) => event_loop,
@@ -1066,11 +1147,14 @@ pub fn run(
         tray: Some(tray),
         menu: Some(menu),
         #[cfg(windows)]
+        update_receiver,
+        #[cfg(windows)]
         menu_position: None,
     };
     event_loop
         .run_app(&mut handler)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    Ok(handler.state.and_then(|state| state.pending_update))
 }
 
 #[cfg(all(test, windows))]

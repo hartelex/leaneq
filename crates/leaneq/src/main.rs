@@ -299,6 +299,58 @@ fn stop_engine() -> Result<(), String> {
     }
 }
 
+fn schedule_update(update_path: &Path, executable_path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        const UPDATE_SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$parent = [int]$env:LEANEQ_UPDATE_PARENT
+while (Get-Process -Id $parent -ErrorAction SilentlyContinue) {
+    Start-Sleep -Milliseconds 200
+}
+$source = $env:LEANEQ_UPDATE_SOURCE
+$target = $env:LEANEQ_UPDATE_TARGET
+for ($attempt = 0; $attempt -lt 120; $attempt++) {
+    try {
+        Move-Item -LiteralPath $source -Destination $target -Force -ErrorAction Stop
+        break
+    } catch {
+        Start-Sleep -Milliseconds 250
+    }
+}
+Start-Process -FilePath $target -WorkingDirectory (Split-Path -Parent $target)
+"#;
+
+        use std::os::windows::process::CommandExt;
+
+        let mut command = Command::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-WindowStyle",
+                "Hidden",
+                "-Command",
+                UPDATE_SCRIPT,
+            ])
+            .env("LEANEQ_UPDATE_PARENT", std::process::id().to_string())
+            .env("LEANEQ_UPDATE_SOURCE", update_path)
+            .env("LEANEQ_UPDATE_TARGET", executable_path)
+            .creation_flags(0x0800_0000)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("could not start update helper: {error}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (update_path, executable_path);
+        Err("automatic updates are supported on Windows only".into())
+    }
+}
+
 fn run_tray() -> Result<(), String> {
     let Some(_mutex) = acquire_tray_mutex()? else {
         return Ok(());
@@ -315,13 +367,30 @@ fn run_tray() -> Result<(), String> {
         "leaneq".to_string(),
         presets_dir,
         settings_path,
-        executable,
+        executable.clone(),
         startup_error,
+        env!("CARGO_PKG_VERSION").to_string(),
     );
     let shutdown_result = stop_engine();
 
     match (tray_result, shutdown_result) {
-        (Ok(()), result) => result,
+        (Ok(update), Ok(())) => match update {
+            Some(update_path) => {
+                let result = schedule_update(&update_path, &executable);
+                if result.is_err() {
+                    let _ = fs::remove_file(update_path);
+                }
+                result
+            }
+            None => Ok(()),
+        },
+        (Ok(Some(update_path)), Err(error)) => {
+            let _ = fs::remove_file(update_path);
+            Err(format!(
+                "could not install the available update because the audio engine did not stop: {error}"
+            ))
+        }
+        (Ok(None), Err(error)) => Err(error),
         (Err(error), Ok(())) => Err(error),
         (Err(error), Err(shutdown_error)) => Err(format!(
             "{error}; additionally failed to stop the audio engine: {shutdown_error}"

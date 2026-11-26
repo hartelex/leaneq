@@ -16,6 +16,8 @@ on supported windows versions, the tray menu follows the system light/dark theme
 2. get a virtual audio device, for example [VB-CABLE](https://vb-audio.com/Cable/index.htm)
 3. select the virtual audio device as input
 
+leaneq checks for updates on startup. When an update is ready, the tray menu says it will install when you exit leaneq.
+
 should work :)
 
 ## audio routing
@@ -36,5 +38,4 @@ leaneq is licensed under the GNU General Public License v3.0 only. See [LICENSE]
 ## what am i working on next
 
 - import presets instead of presets folder
-- program autoupdate with new release
 - per-application routing?  
