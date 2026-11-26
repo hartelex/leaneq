@@ -4,6 +4,8 @@ leaneq is an equalizer program that's lightweight (and lives in your tray)
 the program only takes up 2-4 MB of RAM :)
 [check here](https://postimg.cc/v4BJbk2g)
 
+on supported windows versions, the tray menu follows the system light/dark theme.
+
 <img src="leaneq.png" alt="leaneq" width="500">
 
 
@@ -35,4 +37,4 @@ leaneq is licensed under the GNU General Public License v3.0 only. See [LICENSE]
 
 - import presets instead of presets folder
 - program autoupdate with new release
-- per-application routing?
+- per-application routing?  

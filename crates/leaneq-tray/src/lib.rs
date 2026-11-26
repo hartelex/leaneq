@@ -12,6 +12,8 @@ use leaneq_proto::{
 use muda::ContextMenu;
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
+#[cfg(windows)]
+use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::ScreenToClient};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -477,9 +479,90 @@ fn generate_icon() -> [u8; 32 * 32 * 4] {
     rgba
 }
 
-fn build_menu(state: &TrayState) -> Menu {
-    let menu = Menu::new();
+struct PresetMenuItem {
+    path: PathBuf,
+    config: Option<EqConfig>,
+    item: CheckMenuItem,
+}
 
+struct TrayMenu {
+    menu: Menu,
+    status_item: MenuItem,
+    routing_item: Option<MenuItem>,
+    bypass_item: CheckMenuItem,
+    inputs: Vec<(String, CheckMenuItem)>,
+    output_default: CheckMenuItem,
+    outputs: Vec<(String, CheckMenuItem)>,
+    presets: Vec<PresetMenuItem>,
+    #[cfg(windows)]
+    start_with_windows_item: CheckMenuItem,
+}
+
+impl TrayMenu {
+    fn matches_structure(&self, state: &TrayState) -> bool {
+        self.routing_item.is_some() == state.status.is_some()
+            && self
+                .inputs
+                .iter()
+                .map(|(device, _)| device)
+                .eq(state.inputs.iter())
+            && self
+                .outputs
+                .iter()
+                .map(|(device, _)| device)
+                .eq(state.outputs.iter())
+    }
+
+    fn update(&self, state: &TrayState) {
+        self.status_item.set_text(status_text(state));
+        if let (Some(item), Some(status)) = (&self.routing_item, &state.status) {
+            item.set_text(routing_text(status));
+        }
+
+        self.bypass_item.set_checked(
+            state
+                .status
+                .as_ref()
+                .is_some_and(|status| status.config.bypass),
+        );
+
+        for (device, item) in &self.inputs {
+            item.set_checked(
+                device == &state.settings.input_device
+                    || state
+                        .status
+                        .as_ref()
+                        .is_some_and(|status| status.input_device == *device),
+            );
+        }
+        self.output_default
+            .set_checked(state.settings.output_device.is_empty());
+        for (device, item) in &self.outputs {
+            item.set_checked(device == &state.settings.output_device);
+        }
+
+        for preset in &self.presets {
+            let checked = if let Some(actual) = &state.status {
+                preset
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| preset_matches(&actual.config, config))
+            } else {
+                state
+                    .last_loaded_preset
+                    .as_ref()
+                    .is_some_and(|last| last == &preset.path)
+            };
+            preset.item.set_checked(checked);
+        }
+
+        #[cfg(windows)]
+        self.start_with_windows_item
+            .set_checked(state.start_with_windows);
+    }
+}
+
+fn status_text(state: &TrayState) -> String {
     let mut status_text = match &state.status {
         Some(status) => format!("leaneq: Connected ({} Hz)", status.sample_rate),
         None => state.engine_error.as_ref().map_or_else(
@@ -494,17 +577,109 @@ fn build_menu(state: &TrayState) -> Menu {
     if let Some(error) = &state.startup_error {
         status_text.push_str(&format!(" - startup error: {error}"));
     }
-    let _ = menu.append(&MenuItem::new(status_text, false, None));
-    if let Some(status) = &state.status {
-        let _ = menu.append(&MenuItem::new(
-            format!(
-                "Routing: {} -> {}",
-                status.input_device, status.output_device
-            ),
-            false,
-            None,
-        ));
+    status_text
+}
+
+fn routing_text(status: &EngineStatus) -> String {
+    format!(
+        "Routing: {} -> {}",
+        status.input_device, status.output_device
+    )
+}
+
+#[cfg(windows)]
+fn enable_system_menu_theme(hwnd: isize) {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        Foundation::{FreeLibrary, HWND},
+        System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32},
+    };
+
+    type AllowDarkModeForWindow = unsafe extern "system" fn(HWND, i32) -> i32;
+    type FlushMenuThemes = unsafe extern "system" fn();
+    type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
+
+    let library_name: Vec<u16> = OsStr::new("uxtheme.dll")
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    // Load only from System32; this optional API is not exported on all supported Windows builds.
+    let module = unsafe {
+        LoadLibraryExW(
+            library_name.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    };
+    if module.is_null() {
+        return;
     }
+
+    let set_preferred_app_mode = unsafe { GetProcAddress(module, 135usize as *const u8) };
+    let allow_dark_mode_for_window = unsafe { GetProcAddress(module, 133usize as *const u8) };
+    let flush_menu_themes = unsafe { GetProcAddress(module, 136usize as *const u8) };
+
+    if let Some(set_preferred_app_mode) = set_preferred_app_mode {
+        // SAFETY: uxtheme ordinal 135 is SetPreferredAppMode; 1 selects AllowDark, which follows
+        // the user's Windows theme rather than forcing dark mode.
+        let set_preferred_app_mode: SetPreferredAppMode =
+            unsafe { std::mem::transmute(set_preferred_app_mode) };
+        // SAFETY: The function pointer was resolved from uxtheme ordinal 135.
+        unsafe {
+            set_preferred_app_mode(1);
+        }
+    }
+    if let Some(allow_dark_mode_for_window) = allow_dark_mode_for_window {
+        // SAFETY: uxtheme ordinal 133 is AllowDarkModeForWindow on supported Windows builds.
+        let allow_dark_mode_for_window: AllowDarkModeForWindow =
+            unsafe { std::mem::transmute(allow_dark_mode_for_window) };
+        // SAFETY: `hwnd` is the live tray window owned by TrayIcon; 1 opts it into OS dark mode.
+        unsafe {
+            allow_dark_mode_for_window(hwnd as HWND, 1);
+        }
+    }
+    if let Some(flush_menu_themes) = flush_menu_themes {
+        // SAFETY: uxtheme ordinal 136 is FlushMenuThemes on supported Windows builds.
+        let flush_menu_themes: FlushMenuThemes = unsafe { std::mem::transmute(flush_menu_themes) };
+        // SAFETY: The function pointer was resolved from uxtheme ordinal 136.
+        unsafe { flush_menu_themes() };
+    }
+
+    // SAFETY: `module` is the owned module handle returned by LoadLibraryExW above.
+    unsafe {
+        FreeLibrary(module);
+    }
+}
+
+#[cfg(windows)]
+fn client_menu_position(
+    hwnd: isize,
+    screen_position: muda::dpi::PhysicalPosition<f64>,
+) -> Option<muda::dpi::Position> {
+    let mut point = POINT {
+        x: screen_position.x.round() as i32,
+        y: screen_position.y.round() as i32,
+    };
+    if unsafe { ScreenToClient(hwnd as _, &mut point) } == 0 {
+        return None;
+    }
+
+    Some(muda::dpi::Position::Physical(
+        muda::dpi::PhysicalPosition::new(point.x, point.y),
+    ))
+}
+
+fn build_menu(state: &TrayState) -> TrayMenu {
+    let menu = Menu::new();
+
+    let status_item = MenuItem::new(status_text(state), false, None);
+    let _ = menu.append(&status_item);
+    let routing_item = state.status.as_ref().map(|status| {
+        let item = MenuItem::new(routing_text(status), false, None);
+        let _ = menu.append(&item);
+        item
+    });
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let bypass = state
@@ -517,6 +692,7 @@ fn build_menu(state: &TrayState) -> Menu {
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let inputs_menu = Submenu::with_id("input-devices", "Input device", true);
+    let mut inputs = Vec::with_capacity(state.inputs.len());
     for (index, device) in state.inputs.iter().enumerate() {
         let id = format!("input:{index}");
         let checked = device == &state.settings.input_device
@@ -524,44 +700,51 @@ fn build_menu(state: &TrayState) -> Menu {
                 .status
                 .as_ref()
                 .is_some_and(|status| status.input_device == *device);
-        let _ = inputs_menu.append(&CheckMenuItem::with_id(id, device, true, checked, None));
+        let item = CheckMenuItem::with_id(id, device, true, checked, None);
+        let _ = inputs_menu.append(&item);
+        inputs.push((device.clone(), item));
     }
     let _ = menu.append(&inputs_menu);
 
     let outputs_menu = Submenu::with_id("output-devices", "Output device", true);
-    let _ = outputs_menu.append(&CheckMenuItem::with_id(
+    let output_default = CheckMenuItem::with_id(
         "output:default",
         "Windows default output device",
         true,
         state.settings.output_device.is_empty(),
         None,
-    ));
+    );
+    let _ = outputs_menu.append(&output_default);
+    let mut outputs = Vec::with_capacity(state.outputs.len());
     for (index, device) in state.outputs.iter().enumerate() {
         let id = format!("output:{index}");
-        let _ = outputs_menu.append(&CheckMenuItem::with_id(
+        let item = CheckMenuItem::with_id(
             id,
             device,
             true,
             device == &state.settings.output_device,
             None,
-        ));
+        );
+        let _ = outputs_menu.append(&item);
+        outputs.push((device.clone(), item));
     }
     let _ = menu.append(&outputs_menu);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let presets = scan_presets(&state.presets_dir);
+    let mut preset_items = Vec::with_capacity(presets.len());
     if presets.is_empty() {
-        let _ = menu.append(&MenuItem::new("(No .toml files in presets/)", false, None));
+        let item = MenuItem::new("(No .toml files in presets/)", false, None);
+        let _ = menu.append(&item);
     } else {
         for (name, path) in presets {
+            let config = fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| EqConfig::from_toml_str(&text).ok());
             let checked = if let Some(actual) = &state.status {
-                if let Ok(text) = fs::read_to_string(&path) {
-                    EqConfig::from_toml_str(&text)
-                        .ok()
-                        .is_some_and(|preset| preset_matches(&actual.config, &preset))
-                } else {
-                    false
-                }
+                config
+                    .as_ref()
+                    .is_some_and(|preset| preset_matches(&actual.config, preset))
             } else {
                 state
                     .last_loaded_preset
@@ -570,8 +753,9 @@ fn build_menu(state: &TrayState) -> Menu {
             };
 
             let id = format!("preset:{}", path.to_string_lossy());
-            let item = CheckMenuItem::with_id(MenuId::new(id), name, true, checked, None);
+            let item = CheckMenuItem::with_id(MenuId::new(id), &name, true, checked, None);
             let _ = menu.append(&item);
+            preset_items.push(PresetMenuItem { path, config, item });
         }
     }
 
@@ -589,19 +773,32 @@ fn build_menu(state: &TrayState) -> Menu {
         None,
     ));
     #[cfg(windows)]
-    {
+    let start_with_windows_item = {
         let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&CheckMenuItem::with_id(
+        let item = CheckMenuItem::with_id(
             "start-with-windows",
             "Start with Windows",
             true,
             state.start_with_windows,
             None,
-        ));
-    }
+        );
+        let _ = menu.append(&item);
+        item
+    };
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&MenuItem::with_id("close-tray", "Exit tray", true, None));
-    menu
+    TrayMenu {
+        menu,
+        status_item,
+        routing_item,
+        bypass_item,
+        inputs,
+        output_default,
+        outputs,
+        presets: preset_items,
+        #[cfg(windows)]
+        start_with_windows_item,
+    }
 }
 
 fn run_action(state: &mut TrayState, menu_id: &MenuId) -> Option<bool> {
@@ -709,6 +906,31 @@ fn apply_preset(state: &mut TrayState, path: PathBuf) -> Result<(), String> {
 struct Handler {
     state: Option<TrayState>,
     tray: Option<tray_icon::TrayIcon>,
+    menu: Option<TrayMenu>,
+    #[cfg(windows)]
+    menu_position: Option<muda::dpi::PhysicalPosition<f64>>,
+}
+
+impl Handler {
+    fn update_menu(&mut self, force_rebuild: bool) {
+        let Some(state) = self.state.as_ref() else {
+            return;
+        };
+        let rebuild = force_rebuild
+            || self
+                .menu
+                .as_ref()
+                .map_or(true, |menu| !menu.matches_structure(state));
+        if rebuild {
+            let menu = build_menu(state);
+            if let Some(tray) = &self.tray {
+                tray.set_menu(Some(Box::new(menu.menu.clone())));
+            }
+            self.menu = Some(menu);
+        } else if let Some(menu) = &self.menu {
+            menu.update(state);
+        }
+    }
 }
 
 impl ApplicationHandler for Handler {
@@ -724,34 +946,43 @@ impl ApplicationHandler for Handler {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
-                event,
-                TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. }
-            ) {
+            let click_position = match &event {
+                TrayIconEvent::Click { position, .. }
+                | TrayIconEvent::DoubleClick { position, .. } => Some(*position),
+                _ => None,
+            };
+            if let Some(position) = click_position {
+                #[cfg(windows)]
+                {
+                    self.menu_position = Some(position);
+                }
                 if let Some(state) = &mut self.state {
                     state.refresh_status();
-                    let menu = build_menu(state);
-                    if let Some(tray) = &self.tray {
-                        tray.set_menu(Some(Box::new(menu)));
-                    }
+                    self.update_menu(false);
                 }
             }
         }
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            let mut should_close = false;
+            let menu_id = event.id().clone();
+            let should_close;
             if let Some(state) = &mut self.state {
-                should_close = run_action(state, event.id()) == Some(true);
+                should_close = run_action(state, &menu_id) == Some(true);
                 state.refresh_status();
-                let menu = build_menu(state);
-                if let Some(tray) = &self.tray {
-                    tray.set_menu(Some(Box::new(menu.clone())));
-                    #[cfg(windows)]
-                    if !should_close {
-                        // SAFETY: tray.window_handle() is the live HWND owned by this TrayIcon.
-                        unsafe {
-                            menu.show_context_menu_for_hwnd(tray.window_handle() as isize, None);
-                        }
+            } else {
+                should_close = false;
+            }
+            self.update_menu(menu_id.as_ref() == "refresh");
+            #[cfg(windows)]
+            if !should_close {
+                if let (Some(menu), Some(tray)) = (&self.menu, &self.tray) {
+                    let hwnd = tray.window_handle() as isize;
+                    let position = self
+                        .menu_position
+                        .and_then(|position| client_menu_position(hwnd, position));
+                    // SAFETY: tray.window_handle() is the live HWND owned by this TrayIcon.
+                    unsafe {
+                        menu.menu.show_context_menu_for_hwnd(hwnd, position);
                     }
                 }
             }
@@ -819,7 +1050,7 @@ pub fn run(
         tray_icon::Icon::from_rgba(icon_rgba.to_vec(), 32, 32).map_err(|error| error.to_string())?
     };
     let tray = match TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.menu.clone()))
         .with_tooltip("leaneq")
         .with_icon(icon)
         .build()
@@ -827,10 +1058,15 @@ pub fn run(
         Ok(tray) => tray,
         Err(error) => return Err(error.to_string()),
     };
+    #[cfg(windows)]
+    enable_system_menu_theme(tray.window_handle() as isize);
 
     let mut handler = Handler {
         state: Some(state),
         tray: Some(tray),
+        menu: Some(menu),
+        #[cfg(windows)]
+        menu_position: None,
     };
     event_loop
         .run_app(&mut handler)

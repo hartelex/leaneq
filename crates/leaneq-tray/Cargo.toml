@@ -12,3 +12,6 @@ tray-icon.workspace = true
 muda.workspace = true
 winit.workspace = true
 leaneq-proto = { path = "../leaneq-proto" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }

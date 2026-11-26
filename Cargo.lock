@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "leaneq"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "clap",
  "interprocess",
@@ -1190,6 +1190,7 @@ dependencies = [
  "leaneq-proto",
  "muda",
  "tray-icon",
+ "windows-sys 0.60.2",
  "winit",
 ]
 
